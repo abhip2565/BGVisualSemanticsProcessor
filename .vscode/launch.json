@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:bgImageAnalyser}",
+            "name": "Debug SemanticExplorer",
+            "target": "SemanticExplorer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SemanticExplorer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:bgImageAnalyser}",
+            "name": "Release SemanticExplorer",
+            "target": "SemanticExplorer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SemanticExplorer"
+        }
+    ]
+}
