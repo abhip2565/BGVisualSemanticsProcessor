@@ -20,7 +20,10 @@ public final class VisionLabelExtractor: VisualLabelExtracting {
             handler = VNImageRequestHandler(cgImage: image.cgImage, options: [:])
         }
         
+        let t0 = CFAbsoluteTimeGetCurrent()
         try handler.perform([request])
+        let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[VSLib] VNClassifyImageRequest done \(elapsed)ms")
         
         guard let observations = request.results else {
             return []
