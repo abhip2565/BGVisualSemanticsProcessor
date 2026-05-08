@@ -220,17 +220,20 @@ public final class BGVisualSemanticsProcessor: Sendable {
 
         // Claim batch
         let jobs = try await jobStore.claimBatch(limit: batchSize, now: now)
-        
+
         if jobs.isEmpty {
             let summary = ProcessingSummary(processed: 0, succeeded: 0, failedTransient: 0, failedPermanent: 0, cancelled: 0, skippedGated: false)
             logger.log(.drainCompleted(mode: mode, summary))
             return summary
         }
 
+        print("[VSLib] drain claiming \(jobs.count) jobs: \(jobs.map { String($0.itemID.prefix(8)) }.joined(separator: ", "))")
+
         // Process batch using structured concurrency for controlled parallelism
         let finalSummary = try await withThrowingTaskGroup(of: ResultStatus.self) { group in
             for job in jobs {
                 group.addTask {
+                    print("[VSLib] job starting: \(String(job.itemID.prefix(8))) attempt=\(job.attemptCount)")
                     return try await self.processJob(job, mode: mode)
                 }
             }
@@ -274,7 +277,11 @@ public final class BGVisualSemanticsProcessor: Sendable {
                     modeHint: mode
                 )
 
+                print("[VSLib] pipeline start: \(String(job.itemID.prefix(8))) source=\(context.source)")
+                let t0 = CFAbsoluteTimeGetCurrent()
                 let output = try await pipeline.process(context)
+                let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                print("[VSLib] pipeline done: \(String(job.itemID.prefix(8))) in \(Int(elapsed))ms labels=\(output.labels.count) type=\(output.imageType?.rawValue ?? "nil")")
                 let now = dateProvider.now()
                 
                 let result = VisualSemanticsResult(
