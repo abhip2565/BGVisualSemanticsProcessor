@@ -78,11 +78,11 @@ print("Enqueued \(outcome.enqueued.count) items")
 
 ### 4. Observing Results
 
-Use `resultsStream()` to receive updates in real-time as they are processed.
+Use `makeResultStream()` to receive updates in real-time as they are processed.
 
 ```swift
 Task {
-    for await result in await processor.resultsStream() {
+    for await result in await processor.makeResultStream() {
         if result.resultStatus == .completed {
             print("Item \(result.itemID) identified as \(result.imageType ?? .unknown)")
             print("Labels: \(result.labels.map { $0.name }.joined(separator: ", "))")

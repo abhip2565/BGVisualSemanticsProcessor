@@ -267,43 +267,51 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
         // A6: Drain-level timeout as safety net
         let drainTimeout = config.perJobTimeout * Double(jobs.count + 1)
 
-        let finalSummary: ProcessingSummary = try await withThrowingTaskGroup(of: Void.self) { outerGroup in
-            // Race: drain work vs drain timeout
-            var drainResult: ProcessingSummary?
-
-            outerGroup.addTask {
-                // The actual drain work
-                let summary = try await self.processJobsConcurrently(jobs, concurrency: concurrency, mode: mode)
-                drainResult = summary
+        let finalSummary: ProcessingSummary = await {
+            // Race the real drain work against a timeout
+            let drainTask = Task { [self] in
+                try await self.processJobsConcurrently(jobs, concurrency: concurrency, mode: mode)
             }
-
-            outerGroup.addTask {
-                // Drain timeout watchdog
+            let timeoutTask = Task {
                 try await Task.sleep(nanoseconds: UInt64(drainTimeout * 1_000_000_000))
-                throw VisualSemanticsError.pipelineFailure(reason: "drain timeout after \(Int(drainTimeout))s", isTransient: true)
             }
 
+            let summary: ProcessingSummary
             do {
-                // Wait for whichever finishes first
-                try await outerGroup.next()
-                // Drain work finished first — cancel the timeout watchdog
-                outerGroup.cancelAll()
+                // Wait for drain to finish
+                summary = try await drainTask.value
+                timeoutTask.cancel()
             } catch {
-                // Timeout fired first (or drain threw) — cancel everything
-                outerGroup.cancelAll()
+                // Drain threw (or was cancelled by timeout) — cancel everything
+                drainTask.cancel()
+                timeoutTask.cancel()
                 await batchProcessor.cancelAll()
-                print("[VSLib] drain timeout — cancelled remaining jobs")
+                print("[VSLib] drain failed/timeout — cancelled remaining jobs: \(error.localizedDescription)")
+                summary = ProcessingSummary(
+                    processed: jobs.count,
+                    succeeded: 0,
+                    failedTransient: 0,
+                    failedPermanent: jobs.count,
+                    cancelled: 0,
+                    skippedGated: false
+                )
             }
 
-            return drainResult ?? ProcessingSummary(
-                processed: jobs.count,
-                succeeded: 0,
-                failedTransient: 0,
-                failedPermanent: jobs.count,
-                cancelled: 0,
-                skippedGated: false
-            )
-        }
+            // Also cancel drain if timeout fires first
+            Task { [self] in
+                do {
+                    try await timeoutTask.value
+                    // Timeout completed before drain — cancel drain
+                    drainTask.cancel()
+                    await self.batchProcessor.cancelAll()
+                    print("[VSLib] drain timeout after \(Int(drainTimeout))s — cancelling")
+                } catch {
+                    // Timeout was cancelled (drain finished first) — nothing to do
+                }
+            }
+
+            return summary
+        }()
 
         logger.log(.drainCompleted(mode: mode, finalSummary))
         return finalSummary
@@ -313,10 +321,9 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
     private func processJobsConcurrently(_ jobs: [VisualSemanticsJob], concurrency: Int, mode: ProcessingMode) async throws -> ProcessingSummary {
         var succeeded = 0
         var failedPermanent = 0
-        var failedTransient = 0
         var cancelled = 0
 
-        try await withThrowingTaskGroup(of: ResultStatus.self) { group in
+        await withTaskGroup(of: ResultStatus.self) { group in
             var jobIterator = jobs.makeIterator()
             var active = 0
 
@@ -327,7 +334,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
             }
 
             // As each completes, launch the next
-            for try await status in group {
+            for await status in group {
                 switch status {
                 case .completed: succeeded += 1
                 case .failed: failedPermanent += 1
@@ -345,7 +352,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
         return ProcessingSummary(
             processed: jobs.count,
             succeeded: succeeded,
-            failedTransient: failedTransient,
+            failedTransient: 0,
             failedPermanent: failedPermanent,
             cancelled: cancelled,
             skippedGated: false
