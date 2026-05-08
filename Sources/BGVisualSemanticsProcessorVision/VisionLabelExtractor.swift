@@ -31,7 +31,7 @@ public final class VisionLabelExtractor: VisualLabelExtracting {
                 Self.visionSemaphore.wait()
 
                 let request = VNClassifyImageRequest()
-                request.usesCPUOnly = false
+                request.usesCPUOnly = true
 
                 let handler: VNImageRequestHandler
                 if let buffer = pixelBuffer {
