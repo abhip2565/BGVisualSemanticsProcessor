@@ -47,20 +47,31 @@ public final class VisionImageTypeDetector: ImageTypeDetecting {
 
     private func detectTextBlockCount(image: PreprocessedImage) async -> Int {
         let cgImage = image.cgImage
-        return await withCheckedContinuation { continuation in
-            Self.visionQueue.async {
-                let request = VNDetectTextRectanglesRequest()
-                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-                do {
-                    try handler.perform([request])
-                } catch {
-                    print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
-                    continuation.resume(returning: 0)
-                    return
+
+        let box = ContinuationBox<Int>()
+
+        return await (try? withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
+                guard box.store(continuation) else { return }
+
+                Self.visionQueue.async {
+                    guard !box.isCancelled else { return }
+
+                    let request = VNDetectTextRectanglesRequest()
+                    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                    do {
+                        try handler.perform([request])
+                    } catch {
+                        print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
+                        box.resume(returning: 0)
+                        return
+                    }
+                    box.resume(returning: request.results?.count ?? 0)
                 }
-                continuation.resume(returning: request.results?.count ?? 0)
             }
-        }
+        } onCancel: {
+            box.cancel()
+        }) ?? 0
     }
 
     private func hasScreenLikeAspectRatio(_ ratio: Double) -> Bool {
