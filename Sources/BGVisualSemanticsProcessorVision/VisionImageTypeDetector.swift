@@ -5,8 +5,6 @@ import BGVisualSemanticsProcessor
 /// Detects image type using structural signals (text density, edges, aspect ratio).
 /// Labels are not used — type is about how the image was produced, not its content.
 public final class VisionImageTypeDetector: ImageTypeDetecting {
-    private static let visionQueue = DispatchQueue(label: "com.vault.vision.typedetect", qos: .userInitiated)
-
     public init() {}
 
     public func detectImageType(image: PreprocessedImage, labels: [VisualLabel]) async throws -> VisualImageType {
@@ -48,30 +46,22 @@ public final class VisionImageTypeDetector: ImageTypeDetecting {
     private func detectTextBlockCount(image: PreprocessedImage) async -> Int {
         let cgImage = image.cgImage
 
-        let box = ContinuationBox<Int>()
-
-        return await (try? withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
-                guard box.store(continuation) else { return }
-
-                Self.visionQueue.async {
-                    guard !box.isCancelled else { return }
-
-                    let request = VNDetectTextRectanglesRequest()
-                    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-                    do {
-                        try handler.perform([request])
-                    } catch {
-                        print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
-                        box.resume(returning: 0)
-                        return
-                    }
-                    box.resume(returning: request.results?.count ?? 0)
+        return await withCheckedContinuation { continuation in
+            // Use the same serial Vision queue as VisionLabelExtractor
+            // to prevent concurrent perform() deadlocks
+            VisionLabelExtractor.visionQueue.async {
+                let request = VNDetectTextRectanglesRequest()
+                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                do {
+                    try handler.perform([request])
+                } catch {
+                    print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
+                    continuation.resume(returning: 0)
+                    return
                 }
+                continuation.resume(returning: request.results?.count ?? 0)
             }
-        } onCancel: {
-            box.cancel()
-        }) ?? 0
+        }
     }
 
     private func hasScreenLikeAspectRatio(_ ratio: Double) -> Bool {
