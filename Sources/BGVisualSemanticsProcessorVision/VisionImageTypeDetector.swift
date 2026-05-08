@@ -47,19 +47,36 @@ public final class VisionImageTypeDetector: ImageTypeDetecting {
         let cgImage = image.cgImage
 
         return await withCheckedContinuation { continuation in
-            // Use the same serial Vision queue as VisionLabelExtractor
-            // to prevent concurrent perform() deadlocks
-            VisionLabelExtractor.visionQueue.async {
+            DispatchQueue.global(qos: .userInitiated).async {
+                VisionLabelExtractor.visionSemaphore.wait()
+
                 let request = VNDetectTextRectanglesRequest()
                 let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                let once = OnceFlag()
+
+                // GCD deadline timer
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
+                    if once.claim() {
+                        request.cancel()
+                        VisionLabelExtractor.visionSemaphore.signal()
+                        print("[VSLib] ⏱ Vision text detect timeout after 10s")
+                        continuation.resume(returning: 0)
+                    }
+                }
+
                 do {
                     try handler.perform([request])
+                    if once.claim() {
+                        VisionLabelExtractor.visionSemaphore.signal()
+                        continuation.resume(returning: request.results?.count ?? 0)
+                    }
                 } catch {
-                    print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
-                    continuation.resume(returning: 0)
-                    return
+                    if once.claim() {
+                        VisionLabelExtractor.visionSemaphore.signal()
+                        print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
+                        continuation.resume(returning: 0)
+                    }
                 }
-                continuation.resume(returning: request.results?.count ?? 0)
             }
         }
     }
