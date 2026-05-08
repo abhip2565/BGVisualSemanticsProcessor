@@ -2,7 +2,7 @@ import Foundation
 
 /// The main entry point for the visual semantics library.
 /// Coordinates storage, engine primitives, and the processing pipeline.
-public final class BGVisualSemanticsProcessor: Sendable {
+public final class BGVisualSemanticsProcessor: @unchecked Sendable {
     private let config: VisualSemanticsConfiguration
     private let pipeline: any VisualSemanticsPipeline
     private let jobStore: JobStore
@@ -15,6 +15,7 @@ public final class BGVisualSemanticsProcessor: Sendable {
     private let logger: any VisualSemanticsLogger
     private let dateProvider: any DateProvider
     private let retryClassifier: any RetryClassifying
+    private let drainScheduler: DrainScheduler
 
     public init(
         config: VisualSemanticsConfiguration,
@@ -40,11 +41,16 @@ public final class BGVisualSemanticsProcessor: Sendable {
         self.batchProcessor = BatchProcessor()
         self.broadcaster = ResultBroadcaster()
         self.gate = ProcessingGate()
+        self.drainScheduler = DrainScheduler()
         
         // Recover stale jobs on startup
         Task {
             let threshold = dateProvider.now().addingTimeInterval(-config.staleProcessingTimeout)
-            _ = try? await jobStore.resetStaleJobs(threshold: threshold, now: dateProvider.now())
+            let recovered = try? await jobStore.resetStaleJobs(threshold: threshold, now: dateProvider.now())
+            if let recovered, recovered > 0 {
+                self.logger.log(.staleJobsRecovered(count: recovered))
+                self.scheduleDrain(mode: .foreground)
+            }
         }
     }
 
@@ -65,6 +71,13 @@ public final class BGVisualSemanticsProcessor: Sendable {
         var rejected: [(itemID: String, reason: VisualSemanticsError)] = []
 
         let now = dateProvider.now()
+
+        // A4: Recover stale PROCESSING jobs before checking active state
+        let staleThreshold = now.addingTimeInterval(-config.staleProcessingTimeout)
+        let recoveredCount = try await jobStore.resetStaleJobs(threshold: staleThreshold, now: now)
+        if recoveredCount > 0 {
+            logger.log(.staleJobsRecovered(count: recoveredCount))
+        }
 
         for request in requests {
             do {
@@ -120,6 +133,12 @@ public final class BGVisualSemanticsProcessor: Sendable {
 
         let outcome = EnqueueOutcome(enqueued: enqueued, coalesced: coalesced, rejected: rejected)
         logger.log(.enqueueCompleted(outcome))
+
+        // A1: Auto-drain — kick off processing without blocking the caller
+        if !enqueued.isEmpty {
+            scheduleDrain(mode: .foreground)
+        }
+
         return outcome
     }
 
@@ -184,6 +203,21 @@ public final class BGVisualSemanticsProcessor: Sendable {
 
     // MARK: - Drain
 
+    /// Schedules a drain to run in the background. Coalesces multiple calls.
+    private func scheduleDrain(mode: ProcessingMode) {
+        Task {
+            let shouldStart = await drainScheduler.trySchedule()
+            guard shouldStart else { return }
+
+            do {
+                try await self.drain(mode: mode)
+            } catch {
+                self.logger.log(.storageError(.pipelineFailure(reason: "auto-drain failed: \(error.localizedDescription)", isTransient: true)))
+            }
+            await drainScheduler.clear()
+        }
+    }
+
     @discardableResult
     public func drain(mode: ProcessingMode) async throws -> ProcessingSummary {
         // Enforce gate
@@ -207,6 +241,7 @@ public final class BGVisualSemanticsProcessor: Sendable {
 
     private func performDrain(mode: ProcessingMode) async throws -> ProcessingSummary {
         let batchSize = mode == .foreground ? config.foregroundBatchSize : config.backgroundBatchSize
+        let concurrency = mode == .foreground ? config.foregroundConcurrency : 1
         logger.log(.drainStarted(mode: mode, batchSize: batchSize))
 
         let now = dateProvider.now()
@@ -227,41 +262,152 @@ public final class BGVisualSemanticsProcessor: Sendable {
             return summary
         }
 
-        print("[VSLib] drain claiming \(jobs.count) jobs: \(jobs.map { String($0.itemID.prefix(8)) }.joined(separator: ", "))")
+        print("[VSLib] drain claiming \(jobs.count) jobs (concurrency=\(concurrency)): \(jobs.map { String($0.itemID.prefix(8)) }.joined(separator: ", "))")
 
-        // Process batch using structured concurrency for controlled parallelism
-        let finalSummary = try await withThrowingTaskGroup(of: ResultStatus.self) { group in
-            for job in jobs {
-                group.addTask {
-                    print("[VSLib] job starting: \(String(job.itemID.prefix(8))) attempt=\(job.attemptCount)")
-                    return try await self.processJob(job, mode: mode)
-                }
+        // A6: Drain-level timeout as safety net
+        let drainTimeout = config.perJobTimeout * Double(jobs.count + 1)
+
+        let finalSummary: ProcessingSummary = try await withThrowingTaskGroup(of: Void.self) { outerGroup in
+            // Race: drain work vs drain timeout
+            var drainResult: ProcessingSummary?
+
+            outerGroup.addTask {
+                // The actual drain work
+                let summary = try await self.processJobsConcurrently(jobs, concurrency: concurrency, mode: mode)
+                drainResult = summary
             }
 
-            var succeeded = 0
-            var failedPermanent = 0
-            var cancelled = 0
-
-            for try await status in group {
-                switch status {
-                case .completed: succeeded += 1
-                case .failed: failedPermanent += 1
-                case .cancelled: cancelled += 1
-                }
+            outerGroup.addTask {
+                // Drain timeout watchdog
+                try await Task.sleep(nanoseconds: UInt64(drainTimeout * 1_000_000_000))
+                throw VisualSemanticsError.pipelineFailure(reason: "drain timeout after \(Int(drainTimeout))s", isTransient: true)
             }
-            
-            return ProcessingSummary(
+
+            do {
+                // Wait for whichever finishes first
+                try await outerGroup.next()
+                // Drain work finished first — cancel the timeout watchdog
+                outerGroup.cancelAll()
+            } catch {
+                // Timeout fired first (or drain threw) — cancel everything
+                outerGroup.cancelAll()
+                await batchProcessor.cancelAll()
+                print("[VSLib] drain timeout — cancelled remaining jobs")
+            }
+
+            return drainResult ?? ProcessingSummary(
                 processed: jobs.count,
-                succeeded: succeeded,
+                succeeded: 0,
                 failedTransient: 0,
-                failedPermanent: failedPermanent,
-                cancelled: cancelled,
+                failedPermanent: jobs.count,
+                cancelled: 0,
                 skippedGated: false
             )
         }
 
         logger.log(.drainCompleted(mode: mode, finalSummary))
         return finalSummary
+    }
+
+    // A3: Concurrency-limited parallel processing
+    private func processJobsConcurrently(_ jobs: [VisualSemanticsJob], concurrency: Int, mode: ProcessingMode) async throws -> ProcessingSummary {
+        var succeeded = 0
+        var failedPermanent = 0
+        var failedTransient = 0
+        var cancelled = 0
+
+        try await withThrowingTaskGroup(of: ResultStatus.self) { group in
+            var jobIterator = jobs.makeIterator()
+            var active = 0
+
+            // Seed up to concurrency limit
+            while active < concurrency, let job = jobIterator.next() {
+                group.addTask { await self.processJobSafe(job, mode: mode) }
+                active += 1
+            }
+
+            // As each completes, launch the next
+            for try await status in group {
+                switch status {
+                case .completed: succeeded += 1
+                case .failed: failedPermanent += 1
+                case .cancelled: cancelled += 1
+                }
+                active -= 1
+
+                if let job = jobIterator.next() {
+                    group.addTask { await self.processJobSafe(job, mode: mode) }
+                    active += 1
+                }
+            }
+        }
+
+        return ProcessingSummary(
+            processed: jobs.count,
+            succeeded: succeeded,
+            failedTransient: failedTransient,
+            failedPermanent: failedPermanent,
+            cancelled: cancelled,
+            skippedGated: false
+        )
+    }
+
+    // A5: Error-isolated wrapper — never throws, always returns a status
+    private func processJobSafe(_ job: VisualSemanticsJob, mode: ProcessingMode) async -> ResultStatus {
+        do {
+            return try await processJobWithTimeout(job, mode: mode)
+        } catch {
+            // Last-resort catch: mark job failed so it doesn't stay PROCESSING
+            print("[VSLib] processJobSafe unexpected error for \(String(job.itemID.prefix(8))): \(error)")
+            let now = dateProvider.now()
+            let persistedError = PersistedJobError(
+                code: "UNEXPECTED_ERROR",
+                message: error.localizedDescription,
+                isTransient: true
+            )
+            try? await jobStore.transitionToFailed(jobID: job.jobID, error: persistedError, now: now)
+            let failureResult = VisualSemanticsResult(
+                itemID: job.itemID,
+                jobID: job.jobID,
+                sourceHash: nil,
+                modelVersion: "unknown",
+                resultStatus: .failed,
+                imageType: nil,
+                labels: [],
+                quality: nil,
+                embedding: nil,
+                error: ResultError(code: persistedError.code, message: persistedError.message),
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(config.resultTTL)
+            )
+            try? await resultStore.upsert(failureResult, consumed: false, now: now)
+            await broadcaster.broadcast(failureResult)
+            logger.log(.jobFailed(jobID: job.jobID, itemID: job.itemID, error: .pipelineFailure(reason: error.localizedDescription, isTransient: true), willRetry: false))
+            return .failed
+        }
+    }
+
+    // A2: Per-job timeout enforcement
+    private func processJobWithTimeout(_ job: VisualSemanticsJob, mode: ProcessingMode) async throws -> ResultStatus {
+        let timeout = config.perJobTimeout
+
+        return try await withThrowingTaskGroup(of: ResultStatus.self) { group in
+            // Real work
+            group.addTask {
+                return try await self.processJob(job, mode: mode)
+            }
+
+            // Timeout watchdog
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw VisualSemanticsError.pipelineFailure(reason: "job timeout after \(Int(timeout))s", isTransient: true)
+            }
+
+            // Whichever finishes first wins
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     private func processJob(_ job: VisualSemanticsJob, mode: ProcessingMode) async throws -> ResultStatus {
