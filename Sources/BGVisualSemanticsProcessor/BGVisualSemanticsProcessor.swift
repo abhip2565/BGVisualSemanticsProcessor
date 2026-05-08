@@ -345,6 +345,9 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
     private func processJobSafe(_ job: VisualSemanticsJob, mode: ProcessingMode) async -> ResultStatus {
         do {
             return try await processJobWithTimeout(job, mode: mode)
+        } catch is CancellationError {
+            print("[VSLib] processJobSafe cancelled: \(String(job.itemID.prefix(8)))")
+            return .cancelled
         } catch {
             // Last-resort catch: mark job failed so it doesn't stay PROCESSING
             print("[VSLib] processJobSafe unexpected error for \(String(job.itemID.prefix(8))): \(error)")
@@ -379,6 +382,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
     // A2: Per-job timeout enforcement
     private func processJobWithTimeout(_ job: VisualSemanticsJob, mode: ProcessingMode) async throws -> ResultStatus {
         let timeout = config.perJobTimeout
+        let shortID = String(job.itemID.prefix(8))
 
         return try await withThrowingTaskGroup(of: ResultStatus.self) { group in
             // Real work
@@ -389,6 +393,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
             // Timeout watchdog
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                print("[VSLib] ⏱ timeout fired for \(shortID) after \(Int(timeout))s")
                 throw VisualSemanticsError.pipelineFailure(reason: "job timeout after \(Int(timeout))s", isTransient: true)
             }
 
