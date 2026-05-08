@@ -52,11 +52,8 @@ public final class VisionLabelExtractor: VisualLabelExtracting {
                     }
                 }
 
-                let t0 = CFAbsoluteTimeGetCurrent()
                 do {
                     try handler.perform([request])
-                    let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    print("[VSLib] VNClassifyImageRequest done \(elapsed)ms")
 
                     if once.claim() {
                         Self.visionSemaphore.signal()

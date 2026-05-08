@@ -73,7 +73,6 @@ public final class VisionImageTypeDetector: ImageTypeDetecting {
                 } catch {
                     if once.claim() {
                         VisionLabelExtractor.visionSemaphore.signal()
-                        print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
                         continuation.resume(returning: 0)
                     }
                 }

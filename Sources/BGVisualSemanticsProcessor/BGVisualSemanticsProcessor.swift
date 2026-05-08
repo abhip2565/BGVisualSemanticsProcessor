@@ -262,8 +262,6 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
             return summary
         }
 
-        print("[VSLib] drain claiming \(jobs.count) jobs (concurrency=\(concurrency)): \(jobs.map { String($0.itemID.prefix(8)) }.joined(separator: ", "))")
-
         // A6: Drain-level timeout as safety net (structured concurrency)
         let drainTimeout = config.perJobTimeout * Double(jobs.count + 1)
 
@@ -282,7 +280,6 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
                 return result
             }
         } catch {
-            print("[VSLib] drain timeout/error after \(Int(drainTimeout))s — \(error.localizedDescription)")
             finalSummary = ProcessingSummary(
                 processed: jobs.count,
                 succeeded: 0,
@@ -346,11 +343,9 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
         do {
             return try await processJobWithTimeout(job, mode: mode)
         } catch is CancellationError {
-            print("[VSLib] processJobSafe cancelled: \(String(job.itemID.prefix(8)))")
             return .cancelled
         } catch {
             // Last-resort catch: mark job failed so it doesn't stay PROCESSING
-            print("[VSLib] processJobSafe unexpected error for \(String(job.itemID.prefix(8))): \(error)")
             let now = dateProvider.now()
             let persistedError = PersistedJobError(
                 code: "UNEXPECTED_ERROR",
@@ -393,7 +388,6 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
             // Timeout watchdog
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                print("[VSLib] ⏱ timeout fired for \(shortID) after \(Int(timeout))s")
                 throw VisualSemanticsError.pipelineFailure(reason: "job timeout after \(Int(timeout))s", isTransient: true)
             }
 
@@ -418,11 +412,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
                 modeHint: mode
             )
 
-            print("[VSLib] pipeline start: \(String(job.itemID.prefix(8))) source=\(context.source)")
-            let t0 = CFAbsoluteTimeGetCurrent()
             let output = try await pipeline.process(context)
-            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-            print("[VSLib] pipeline done: \(String(job.itemID.prefix(8))) in \(Int(elapsed))ms labels=\(output.labels.count) type=\(output.imageType?.rawValue ?? "nil")")
 
             try Task.checkCancellation()
 
@@ -455,7 +445,6 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
 
         } catch is CancellationError {
             let now = dateProvider.now()
-            print("[VSLib] job cancelled: \(String(job.itemID.prefix(8)))")
             try? await jobStore.transitionToCancelled(jobID: job.jobID, now: now)
 
             let cancelledResult = VisualSemanticsResult(
@@ -489,8 +478,6 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
                 message: error.localizedDescription,
                 isTransient: isTransient
             )
-
-            print("[VSLib] job error: \(String(job.itemID.prefix(8))) transient=\(isTransient) attempt=\(job.attemptCount)/\(config.maxAttempts) err=\(error.localizedDescription.prefix(80))")
 
             if isTransient && job.attemptCount < config.maxAttempts {
                 let delay = calculateRetryDelay(attempt: job.attemptCount)

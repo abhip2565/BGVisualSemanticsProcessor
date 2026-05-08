@@ -20,10 +20,7 @@ public final class VisionImageLoader: ImageLoading {
     }
     
     private func loadFromFile(path: String) throws -> LoadedImage {
-        let shortPath = String(path.suffix(30))
-        let exists = FileManager.default.fileExists(atPath: path)
-        print("[VSLib] file load: \(shortPath) exists=\(exists)")
-        guard exists else {
+        guard FileManager.default.fileExists(atPath: path) else {
             throw VisualSemanticsError.imageNotFound(reason: "File not found: \(path)")
         }
         let url = URL(fileURLWithPath: path)
@@ -60,33 +57,22 @@ public final class VisionImageLoader: ImageLoading {
         options.deliveryMode = .highQualityFormat
         options.isSynchronous = false
 
-        let shortId = String(identifier.prefix(12))
-        print("[VSLib] PHAsset load start: \(shortId) networkAllowed=\(options.isNetworkAccessAllowed)")
-
         return try await withCheckedThrowingContinuation { continuation in
             let assets = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
             guard let asset = assets.firstObject else {
-                print("[VSLib] PHAsset not found: \(shortId)")
                 continuation.resume(throwing: VisualSemanticsError.imageNotFound(reason: "PHAsset not found: \(identifier)"))
                 return
             }
 
-            print("[VSLib] PHAsset found: \(shortId) pixel=\(asset.pixelWidth)x\(asset.pixelHeight)")
-
-            var callbackCount = 0
             PHImageManager.default().requestImage(for: asset, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { image, info in
-                callbackCount += 1
                 let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                print("[VSLib] PHAsset callback #\(callbackCount): \(shortId) degraded=\(isDegraded) hasImage=\(image != nil)")
 
                 if let error = info?[PHImageErrorKey] as? Error {
-                    print("[VSLib] PHAsset error: \(shortId) \(error.localizedDescription)")
                     continuation.resume(throwing: VisualSemanticsError.imageDecodeFailed(reason: error.localizedDescription))
                     return
                 }
 
                 if let uiImage = image, let cgImage = uiImage.cgImage {
-                    print("[VSLib] PHAsset loaded: \(shortId) size=\(cgImage.width)x\(cgImage.height)")
                     continuation.resume(returning: LoadedImage(
                         cgImage: cgImage,
                         width: cgImage.width,
@@ -94,10 +80,8 @@ public final class VisionImageLoader: ImageLoading {
                         sourceHash: identifier
                     ))
                 } else if isDegraded {
-                    print("[VSLib] PHAsset degraded, waiting: \(shortId)")
                     return
                 } else {
-                    print("[VSLib] PHAsset no image: \(shortId)")
                     continuation.resume(throwing: VisualSemanticsError.imageDecodeFailed(reason: "Failed to get CGImage from PHAsset"))
                 }
             }
