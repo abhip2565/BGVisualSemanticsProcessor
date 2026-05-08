@@ -264,61 +264,41 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
 
         print("[VSLib] drain claiming \(jobs.count) jobs (concurrency=\(concurrency)): \(jobs.map { String($0.itemID.prefix(8)) }.joined(separator: ", "))")
 
-        // A6: Drain-level timeout as safety net
+        // A6: Drain-level timeout as safety net (structured concurrency)
         let drainTimeout = config.perJobTimeout * Double(jobs.count + 1)
 
-        let finalSummary: ProcessingSummary = await {
-            // Race the real drain work against a timeout
-            let drainTask = Task { [self] in
-                try await self.processJobsConcurrently(jobs, concurrency: concurrency, mode: mode)
-            }
-            let timeoutTask = Task {
-                try await Task.sleep(nanoseconds: UInt64(drainTimeout * 1_000_000_000))
-            }
-
-            let summary: ProcessingSummary
-            do {
-                // Wait for drain to finish
-                summary = try await drainTask.value
-                timeoutTask.cancel()
-            } catch {
-                // Drain threw (or was cancelled by timeout) — cancel everything
-                drainTask.cancel()
-                timeoutTask.cancel()
-                await batchProcessor.cancelAll()
-                print("[VSLib] drain failed/timeout — cancelled remaining jobs: \(error.localizedDescription)")
-                summary = ProcessingSummary(
-                    processed: jobs.count,
-                    succeeded: 0,
-                    failedTransient: 0,
-                    failedPermanent: jobs.count,
-                    cancelled: 0,
-                    skippedGated: false
-                )
-            }
-
-            // Also cancel drain if timeout fires first
-            Task { [self] in
-                do {
-                    try await timeoutTask.value
-                    // Timeout completed before drain — cancel drain
-                    drainTask.cancel()
-                    await self.batchProcessor.cancelAll()
-                    print("[VSLib] drain timeout after \(Int(drainTimeout))s — cancelling")
-                } catch {
-                    // Timeout was cancelled (drain finished first) — nothing to do
+        let finalSummary: ProcessingSummary
+        do {
+            finalSummary = try await withThrowingTaskGroup(of: ProcessingSummary.self) { group in
+                group.addTask {
+                    await self.processJobsConcurrently(jobs, concurrency: concurrency, mode: mode)
                 }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(drainTimeout * 1_000_000_000))
+                    throw VisualSemanticsError.pipelineFailure(reason: "drain timeout after \(Int(drainTimeout))s", isTransient: true)
+                }
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
             }
-
-            return summary
-        }()
+        } catch {
+            print("[VSLib] drain timeout/error after \(Int(drainTimeout))s — \(error.localizedDescription)")
+            finalSummary = ProcessingSummary(
+                processed: jobs.count,
+                succeeded: 0,
+                failedTransient: 0,
+                failedPermanent: jobs.count,
+                cancelled: 0,
+                skippedGated: false
+            )
+        }
 
         logger.log(.drainCompleted(mode: mode, finalSummary))
         return finalSummary
     }
 
     // A3: Concurrency-limited parallel processing
-    private func processJobsConcurrently(_ jobs: [VisualSemanticsJob], concurrency: Int, mode: ProcessingMode) async throws -> ProcessingSummary {
+    private func processJobsConcurrently(_ jobs: [VisualSemanticsJob], concurrency: Int, mode: ProcessingMode) async -> ProcessingSummary {
         var succeeded = 0
         var failedPermanent = 0
         var cancelled = 0
@@ -333,7 +313,7 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
                 active += 1
             }
 
-            // As each completes, launch the next
+            // As each completes, launch the next (stop launching if cancelled)
             for await status in group {
                 switch status {
                 case .completed: succeeded += 1
@@ -341,6 +321,8 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
                 case .cancelled: cancelled += 1
                 }
                 active -= 1
+
+                if Task.isCancelled { continue }
 
                 if let job = jobIterator.next() {
                     group.addTask { await self.processJobSafe(job, mode: mode) }
@@ -418,125 +400,124 @@ public final class BGVisualSemanticsProcessor: @unchecked Sendable {
     }
 
     private func processJob(_ job: VisualSemanticsJob, mode: ProcessingMode) async throws -> ResultStatus {
-        let jobTask = Task {
-            let startTime = CFAbsoluteTimeGetCurrent()
-            logger.log(.jobStarted(jobID: job.jobID, itemID: job.itemID, attempt: job.attemptCount))
-            
-            do {
-                let context = PipelineContext(
-                    jobID: job.jobID,
-                    itemID: job.itemID,
-                    source: try mapSource(job.source),
-                    modeHint: mode
-                )
+        let startTime = CFAbsoluteTimeGetCurrent()
+        logger.log(.jobStarted(jobID: job.jobID, itemID: job.itemID, attempt: job.attemptCount))
 
-                print("[VSLib] pipeline start: \(String(job.itemID.prefix(8))) source=\(context.source)")
-                let t0 = CFAbsoluteTimeGetCurrent()
-                let output = try await pipeline.process(context)
-                let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-                print("[VSLib] pipeline done: \(String(job.itemID.prefix(8))) in \(Int(elapsed))ms labels=\(output.labels.count) type=\(output.imageType?.rawValue ?? "nil")")
-                let now = dateProvider.now()
-                
-                let result = VisualSemanticsResult(
-                    itemID: job.itemID,
-                    jobID: job.jobID,
-                    sourceHash: output.sourceHash,
-                    modelVersion: output.modelVersion,
-                    resultStatus: .completed,
-                    imageType: output.imageType,
-                    labels: output.labels,
-                    quality: output.quality,
-                    embedding: output.embedding,
-                    error: nil,
-                    createdAt: now,
-                    expiresAt: now.addingTimeInterval(config.resultTTL)
-                )
+        do {
+            try Task.checkCancellation()
 
-                try await resultStore.upsert(result, consumed: false, now: now)
-                try await jobStore.transitionToCompleted(jobID: job.jobID, now: now)
-                if let path = job.ownedFilePath { await fileStore.deleteFile(atPath: path) }
-                
-                await broadcaster.broadcast(result)
-                
-                let duration = CFAbsoluteTimeGetCurrent() - startTime
-                logger.log(.jobCompleted(jobID: job.jobID, itemID: job.itemID, durationSec: duration))
-                return ResultStatus.completed
+            let context = PipelineContext(
+                jobID: job.jobID,
+                itemID: job.itemID,
+                source: try mapSource(job.source),
+                modeHint: mode
+            )
 
-            } catch is CancellationError {
-                let now = dateProvider.now()
-                try await jobStore.transitionToCancelled(jobID: job.jobID, now: now)
-                
-                // Upsert cancelled result
-                let cancelledResult = VisualSemanticsResult(
+            print("[VSLib] pipeline start: \(String(job.itemID.prefix(8))) source=\(context.source)")
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let output = try await pipeline.process(context)
+            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            print("[VSLib] pipeline done: \(String(job.itemID.prefix(8))) in \(Int(elapsed))ms labels=\(output.labels.count) type=\(output.imageType?.rawValue ?? "nil")")
+
+            try Task.checkCancellation()
+
+            let now = dateProvider.now()
+
+            let result = VisualSemanticsResult(
+                itemID: job.itemID,
+                jobID: job.jobID,
+                sourceHash: output.sourceHash,
+                modelVersion: output.modelVersion,
+                resultStatus: .completed,
+                imageType: output.imageType,
+                labels: output.labels,
+                quality: output.quality,
+                embedding: output.embedding,
+                error: nil,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(config.resultTTL)
+            )
+
+            try await resultStore.upsert(result, consumed: false, now: now)
+            try await jobStore.transitionToCompleted(jobID: job.jobID, now: now)
+            if let path = job.ownedFilePath { await fileStore.deleteFile(atPath: path) }
+
+            await broadcaster.broadcast(result)
+
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            logger.log(.jobCompleted(jobID: job.jobID, itemID: job.itemID, durationSec: duration))
+            return ResultStatus.completed
+
+        } catch is CancellationError {
+            let now = dateProvider.now()
+            print("[VSLib] job cancelled: \(String(job.itemID.prefix(8)))")
+            try? await jobStore.transitionToCancelled(jobID: job.jobID, now: now)
+
+            let cancelledResult = VisualSemanticsResult(
+                itemID: job.itemID,
+                jobID: job.jobID,
+                sourceHash: nil,
+                modelVersion: "unknown",
+                resultStatus: .cancelled,
+                imageType: nil,
+                labels: [],
+                quality: nil,
+                embedding: nil,
+                error: nil,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(config.resultTTL)
+            )
+            try? await resultStore.upsert(cancelledResult, consumed: false, now: now)
+            if let path = job.ownedFilePath { await fileStore.deleteFile(atPath: path) }
+
+            await broadcaster.broadcast(cancelledResult)
+            logger.log(.jobCancelled(jobID: job.jobID, itemID: job.itemID, reason: .userRequested))
+            return ResultStatus.cancelled
+
+        } catch {
+            let now = dateProvider.now()
+            let isTransient = retryClassifier.isTransient(error)
+            let vsError = (error as? VisualSemanticsError) ?? .pipelineFailure(reason: error.localizedDescription, isTransient: isTransient)
+
+            let persistedError = PersistedJobError(
+                code: String(describing: vsError),
+                message: error.localizedDescription,
+                isTransient: isTransient
+            )
+
+            print("[VSLib] job error: \(String(job.itemID.prefix(8))) transient=\(isTransient) attempt=\(job.attemptCount)/\(config.maxAttempts) err=\(error.localizedDescription.prefix(80))")
+
+            if isTransient && job.attemptCount < config.maxAttempts {
+                let delay = calculateRetryDelay(attempt: job.attemptCount)
+                let nextAttempt = now.addingTimeInterval(delay)
+                try? await jobStore.transitionToPending(jobID: job.jobID, error: persistedError, nextAttemptAt: nextAttempt, now: now)
+                logger.log(.jobFailed(jobID: job.jobID, itemID: job.itemID, error: vsError, willRetry: true))
+                return ResultStatus.failed
+            } else {
+                try? await jobStore.transitionToFailed(jobID: job.jobID, error: persistedError, now: now)
+
+                let failureResult = VisualSemanticsResult(
                     itemID: job.itemID,
                     jobID: job.jobID,
                     sourceHash: nil,
                     modelVersion: "unknown",
-                    resultStatus: .cancelled,
+                    resultStatus: .failed,
                     imageType: nil,
                     labels: [],
                     quality: nil,
                     embedding: nil,
-                    error: nil,
+                    error: ResultError(code: persistedError.code, message: persistedError.message),
                     createdAt: now,
                     expiresAt: now.addingTimeInterval(config.resultTTL)
                 )
-                try await resultStore.upsert(cancelledResult, consumed: false, now: now)
+                try? await resultStore.upsert(failureResult, consumed: false, now: now)
                 if let path = job.ownedFilePath { await fileStore.deleteFile(atPath: path) }
-                
-                await broadcaster.broadcast(cancelledResult)
-                logger.log(.jobCancelled(jobID: job.jobID, itemID: job.itemID, reason: .userRequested))
-                return ResultStatus.cancelled
-                
-            } catch {
-                let now = dateProvider.now()
-                let isTransient = retryClassifier.isTransient(error)
-                let vsError = (error as? VisualSemanticsError) ?? .pipelineFailure(reason: error.localizedDescription, isTransient: isTransient)
-                
-                let persistedError = PersistedJobError(
-                    code: String(describing: vsError),
-                    message: error.localizedDescription,
-                    isTransient: isTransient
-                )
 
-                if isTransient && job.attemptCount < config.maxAttempts {
-                    let delay = calculateRetryDelay(attempt: job.attemptCount)
-                    let nextAttempt = now.addingTimeInterval(delay)
-                    try await jobStore.transitionToPending(jobID: job.jobID, error: persistedError, nextAttemptAt: nextAttempt, now: now)
-                    logger.log(.jobFailed(jobID: job.jobID, itemID: job.itemID, error: vsError, willRetry: true))
-                    return ResultStatus.failed // Still "failed" this run
-                } else {
-                    try await jobStore.transitionToFailed(jobID: job.jobID, error: persistedError, now: now)
-                    
-                    // Upsert failure result
-                    let failureResult = VisualSemanticsResult(
-                        itemID: job.itemID,
-                        jobID: job.jobID,
-                        sourceHash: nil,
-                        modelVersion: "unknown",
-                        resultStatus: .failed,
-                        imageType: nil,
-                        labels: [],
-                        quality: nil,
-                        embedding: nil,
-                        error: ResultError(code: persistedError.code, message: persistedError.message),
-                        createdAt: now,
-                        expiresAt: now.addingTimeInterval(config.resultTTL)
-                    )
-                    try await resultStore.upsert(failureResult, consumed: false, now: now)
-                    if let path = job.ownedFilePath { await fileStore.deleteFile(atPath: path) }
-                    
-                    await broadcaster.broadcast(failureResult)
-                    logger.log(.jobFailed(jobID: job.jobID, itemID: job.itemID, error: vsError, willRetry: false))
-                    return ResultStatus.failed
-                }
+                await broadcaster.broadcast(failureResult)
+                logger.log(.jobFailed(jobID: job.jobID, itemID: job.itemID, error: vsError, willRetry: false))
+                return ResultStatus.failed
             }
         }
-
-        await batchProcessor.register(jobID: job.jobID, canceller: { jobTask.cancel() })
-        let status = try await jobTask.value
-        await batchProcessor.unregister(jobID: job.jobID)
-        return status
     }
 
     // MARK: - Results
