@@ -5,10 +5,12 @@ import BGVisualSemanticsProcessor
 /// Detects image type using structural signals (text density, edges, aspect ratio).
 /// Labels are not used — type is about how the image was produced, not its content.
 public final class VisionImageTypeDetector: ImageTypeDetecting {
+    private static let visionQueue = DispatchQueue(label: "com.vault.vision.typedetect", qos: .userInitiated)
+
     public init() {}
 
     public func detectImageType(image: PreprocessedImage, labels: [VisualLabel]) async throws -> VisualImageType {
-        let textCount = detectTextBlockCount(image: image)
+        let textCount = await detectTextBlockCount(image: image)
         let aspectRatio = Double(image.height) / Double(max(image.width, 1))
         let edgeStats = computeEdgeStats(image: image)
 
@@ -43,11 +45,22 @@ public final class VisionImageTypeDetector: ImageTypeDetecting {
         return .unknown
     }
 
-    private func detectTextBlockCount(image: PreprocessedImage) -> Int {
-        let request = VNDetectTextRectanglesRequest()
-        let handler = VNImageRequestHandler(cgImage: image.cgImage, options: [:])
-        try? handler.perform([request])
-        return request.results?.count ?? 0
+    private func detectTextBlockCount(image: PreprocessedImage) async -> Int {
+        let cgImage = image.cgImage
+        return await withCheckedContinuation { continuation in
+            Self.visionQueue.async {
+                let request = VNDetectTextRectanglesRequest()
+                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                do {
+                    try handler.perform([request])
+                } catch {
+                    print("[VSLib] VNDetectTextRectangles failed: \(error.localizedDescription)")
+                    continuation.resume(returning: 0)
+                    return
+                }
+                continuation.resume(returning: request.results?.count ?? 0)
+            }
+        }
     }
 
     private func hasScreenLikeAspectRatio(_ ratio: Double) -> Bool {
