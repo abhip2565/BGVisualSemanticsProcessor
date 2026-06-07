@@ -1,6 +1,6 @@
 #if canImport(BackgroundTasks)
 import Foundation
-import BackgroundTasks
+@preconcurrency import BackgroundTasks
 
 /// Thread-safe storage for deferred processor binding.
 /// BGTaskScheduler requires handler registration before app finishes launching,
